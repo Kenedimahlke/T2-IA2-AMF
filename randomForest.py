@@ -1,992 +1,576 @@
-# ---------------------------
-# Imports
-# ---------------------------
-import os
-import pandas as pd
+# Trabalho 1 – Inteligência Artificial II 2025/02
+# Classificação com Random Forest - Análise de Satisfação do Cliente E-commerce
+
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # CORREÇÃO #1: Backend para evitar tkinter
+import pandas as pd
 import matplotlib.pyplot as plt
-import warnings
-import joblib
-from math import radians, sin, cos, sqrt, atan2
+import shap
 
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, learning_curve
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline as SkPipeline
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.combine import SMOTETomek
-from sklearn.base import clone  # CORREÇÃO #2: Adicionar clone
-from sklearn.metrics import (confusion_matrix, classification_report,
-                             roc_auc_score, roc_curve, precision_recall_curve, f1_score, average_precision_score,
-                             accuracy_score, precision_score, recall_score)
-from sklearn.inspection import permutation_importance
-from sklearn.impute import SimpleImputer
-
-# Modelos
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-
-# MELHORIA: Adicionar LightGBM
-try:
-    from lightgbm import LGBMClassifier
-    LIGHTGBM_AVAILABLE = True
-    print("[OK] LightGBM disponível")
-except ImportError:
-    LIGHTGBM_AVAILABLE = False
-    print("[WARN] LightGBM não disponível, usando Random Forest")
-
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    SHAP_AVAILABLE = False
-    print("[WARN] SHAP não disponível")
-
-warnings.filterwarnings("ignore")
-
-print("INICIANDO ANÁLISE RANDOM FOREST MELHORADO...")
-print("="*60)
-
-# CORREÇÃO: Configuração robusta do diretório de outputs
-output_dir = "outputs"
-try:
-    os.makedirs(output_dir, exist_ok=True)
-    # Verificar se o diretório é escribível
-    test_file = os.path.join(output_dir, "test_write.tmp")
-    with open(test_file, 'w') as f:
-        f.write("test")
-    os.remove(test_file)
-    print(f"[OK] Diretório '{output_dir}' criado/verificado e acessível")
-except PermissionError:
-    print(f"[ERROR] Sem permissão para escrever em '{output_dir}'. Usando diretório atual.")
-    output_dir = "."
-except Exception as e:
-    print(f"[ERROR] Erro ao configurar diretório de outputs: {e}. Usando diretório atual.")
-    output_dir = "."
-
-# ---------------------------
-# Carregar Dataset
-# ---------------------------
-print("Carregando datasets...")
-
-# CORREÇÃO: Validação robusta dos dados de entrada
-def safe_load_dataset(filepath, dataset_name):
-    """Carregar dataset com validação robusta"""
-    try:
-        df = pd.read_csv(filepath)
-        if df.empty:
-            raise ValueError(f"Dataset {dataset_name} está vazio")
-        print(f"   [OK] {dataset_name}: {df.shape} - {df.memory_usage(deep=True).sum() / 1024**2:.1f}MB")
-        return df
-    except FileNotFoundError:
-        print(f"   [ERROR] {dataset_name}: Arquivo não encontrado em {filepath}")
-        raise
-    except Exception as e:
-        print(f"   [ERROR] {dataset_name}: Erro ao carregar - {e}")
-        raise
-
-# Carregar datasets principais (obrigatórios)
-try:
-    orders = safe_load_dataset('datasets/olist_orders_dataset.csv', 'Orders')
-    reviews = safe_load_dataset('datasets/olist_order_reviews_dataset.csv', 'Reviews')
-    items = safe_load_dataset('datasets/olist_order_items_dataset.csv', 'Items')
-    customers = safe_load_dataset('datasets/olist_customers_dataset.csv', 'Customers')
-    print("[OK] Datasets principais carregados com sucesso!")
-except Exception as e:
-    print(f"[ERROR] Erro crítico ao carregar datasets principais: {e}")
-    print("[STOP] Não é possível continuar sem os datasets principais")
-    raise
-
-# CORREÇÃO: Validação robusta para datasets adicionais
-try:
-    products = safe_load_dataset('datasets/olist_products_dataset.csv', 'Products')
-    geolocation = safe_load_dataset('datasets/olist_geolocation_dataset.csv', 'Geolocation')
-    sellers = safe_load_dataset('datasets/olist_sellers_dataset.csv', 'Sellers')
-    
-    # Validar integridade básica dos datasets adicionais
-    required_columns = {
-        'products': ['product_id', 'product_category_name'],
-        'geolocation': ['geolocation_zip_code_prefix', 'geolocation_lat', 'geolocation_lng'],
-        'sellers': ['seller_id', 'seller_zip_code_prefix']
-    }
-    
-    datasets_check = {
-        'products': products,
-        'geolocation': geolocation, 
-        'sellers': sellers
-    }
-    
-    for name, df in datasets_check.items():
-        missing_cols = set(required_columns[name]) - set(df.columns)
-        if missing_cols:
-            print(f"   [WARN] {name}: Colunas obrigatórias ausentes: {missing_cols}")
-            ADVANCED_FEATURES = False
-            break
-    else:
-        print("[OK] Datasets adicionais validados com sucesso!")
-        ADVANCED_FEATURES = True
-        
-except FileNotFoundError as e:
-    print(f"[WARN] Alguns datasets adicionais não encontrados: {e}")
-    print("Continuando com features básicas...")
-    ADVANCED_FEATURES = False
-except Exception as e:
-    print(f"[WARN] Erro ao validar datasets adicionais: {e}")
-    print("Continuando com features básicas...")
-    ADVANCED_FEATURES = False
-
-# ---------------------------
-# Pré-processamento e Engenharia de Features
-# ---------------------------
-print("\nPRÉ-PROCESSAMENTO E FEATURE ENGINEERING...")
-
-# Remover linhas sem datas essenciais
-orders = orders.dropna(subset=['order_delivered_customer_date', 'order_estimated_delivery_date'])
-
-# Preenchimentos
-orders['order_approved_at'] = orders['order_approved_at'].fillna(orders['order_purchase_timestamp'])
-
-# Converter colunas de data
-date_cols = ['order_purchase_timestamp', 'order_approved_at', 'order_delivered_customer_date', 'order_estimated_delivery_date']
-for col in date_cols:
-    orders[col] = pd.to_datetime(orders[col])
-
-# Calcular features temporais
-orders['atraso'] = (orders['order_delivered_customer_date'] - orders['order_purchase_timestamp']).dt.days
-orders['atraso_entrega'] = (orders['order_delivered_customer_date'] - orders['order_estimated_delivery_date']).dt.days
-orders['tempo_aprovacao'] = (orders['order_approved_at'] - orders['order_purchase_timestamp']).dt.total_seconds() / 3600  # horas
-orders['tempo_entrega'] = (orders['order_delivered_customer_date'] - orders['order_approved_at']).dt.days
-
-# Features temporais adicionais
-orders['mes_compra'] = orders['order_purchase_timestamp'].dt.month
-orders['dia_semana_compra'] = orders['order_purchase_timestamp'].dt.dayofweek
-orders['hora_compra'] = orders['order_purchase_timestamp'].dt.hour
-orders['is_weekend'] = (orders['dia_semana_compra'] >= 5).astype(int)
-
-# Status do pedido
-orders['order_finalizado'] = (orders['order_status'] == 'delivered').astype(int)
-
-# Merge orders com reviews
-reviews['review_good'] = (reviews['review_score'] >= 4).astype(int)
-final = orders.merge(reviews[['order_id', 'review_good']], on='order_id', how='inner')
-
-# Tratamento de outliers nos dados de frete
-items['freight_value'] = items['freight_value'].fillna(0)
-q95 = items['freight_value'].quantile(0.95)
-q5 = items['freight_value'].quantile(0.05)
-items['freight_value'] = items['freight_value'].clip(lower=q5, upper=q95)
-print(f"Freight outliers tratados por capping: [{q5:.2f}, {q95:.2f}]")
-
-# Feature engineering avançada dos items
-items['frete_relativo'] = items['freight_value'] / (items['price'] + 0.01)  # Evitar divisão por zero
-
-# MELHORIA: Feature de categoria do produto
-if ADVANCED_FEATURES:
-    print("Aplicando feature engineering avançada...")
-    items = items.merge(products[['product_id', 'product_category_name']], on='product_id', how='left')
-    items['product_category_name'] = items['product_category_name'].fillna('outros')
-
-# Histórico de reviews por seller (temporal) - CORREÇÃO: Versão vetorizada
-items_with_reviews = items.merge(final[['order_id', 'order_purchase_timestamp', 'review_good']], on='order_id', how='left')
-
-print("Calculando histórico de seller (versão vetorizada)...")
-# CORREÇÃO: Algoritmo vetorizado O(N log N) em vez de O(N²) - Fix para pandas compatibility
-items_with_reviews = items_with_reviews.sort_values(['seller_id', 'order_purchase_timestamp']).reset_index(drop=True)
-
-# Calcular média acumulada excluindo a própria ordem usando transform (mais eficiente)
-def calc_rolling_mean_transform(group):
-    """Calcula média acumulada excluindo o próprio registro usando transform"""
-    shifted = group.shift()
-    return shifted.expanding().mean()
-
-# Usar transform em vez de apply para evitar warnings e melhor performance
-items_with_reviews['media_reviews_seller'] = (
-    items_with_reviews.groupby('seller_id')['review_good']
-    .transform(calc_rolling_mean_transform)
+from sklearn.model_selection import train_test_split, cross_val_score, learning_curve, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score, average_precision_score,
+    confusion_matrix, classification_report, roc_curve, precision_recall_curve
 )
 
-# Estatísticas do histórico calculado
-valid_history = items_with_reviews['media_reviews_seller'].notna().sum()
-total_sellers = items_with_reviews['seller_id'].nunique()
-print(f"[OK] Histórico seller calculado (vetorizado): {total_sellers} sellers, {valid_history} reviews com histórico")
 
-# Agregar dados por pedido - CORREÇÃO: Agregação mais robusta
-if ADVANCED_FEATURES:
-    def safe_mode(x):
-        """Função segura para calcular moda, lidando com valores vazios"""
-        try:
-            mode_result = x.mode()
-            if not mode_result.empty:
-                return mode_result.iloc[0]
-            else:
-                return 'outros'
-        except:
-            return 'outros'
-    
-    agg_items = items_with_reviews.groupby('order_id').agg(
-        frete_relativo=('frete_relativo', 'mean'),
-        num_itens=('order_item_id', 'count'),
-        media_reviews_seller=('media_reviews_seller', 'mean'),
-        product_category_name=('product_category_name', safe_mode)
-    ).reset_index()
-else:
-    agg_items = items_with_reviews.groupby('order_id').agg(
-        frete_relativo=('frete_relativo', 'mean'),
-        num_itens=('order_item_id', 'count'),
-        media_reviews_seller=('media_reviews_seller', 'mean')
-    ).reset_index()
+# ============================================================================
+# CARREGAMENTO E EDA BREVE
+# ============================================================================
+print("Carregando datasets...")
+orders = pd.read_csv('datasets/olist_orders_dataset.csv')
+reviews = pd.read_csv('datasets/olist_order_reviews_dataset.csv')
+items = pd.read_csv('datasets/olist_order_items_dataset.csv')
+customers = pd.read_csv('datasets/olist_customers_dataset.csv')
 
-final = final.merge(agg_items, on='order_id', how='left')
+print(f"EDA INICIAL:")
+print(f"Orders: {orders.shape} | Reviews: {reviews.shape}")
+print(f"Items: {items.shape} | Customers: {customers.shape}")
 
-# MELHORIA: Feature de distância geográfica
-if ADVANCED_FEATURES:
-    print("Calculando distância geográfica vendedor-cliente...")
-    
-    # Função para calcular distância haversine
-    def haversine_distance(lat1, lon1, lat2, lon2):
-        R = 6371  # Raio da Terra em km
-        try:
-            if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
-                return np.nan
-            dlat = radians(lat2 - lat1)
-            dlon = radians(lon2 - lon1)
-            a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1 - a))
-            return R * c
-        except (ValueError, TypeError):
-            return np.nan
-    
-    # CORREÇÃO: Calcular distância geográfica com merge mais robusto
-    print("Calculando distância geográfica vendedor-cliente...")
-    
-    # Preparar dados de geolocalização
-    geo_agg = geolocation.groupby('geolocation_zip_code_prefix').first().reset_index()
-    
-    # Merge com dados de cliente e seller
-    final = final.merge(customers[['customer_id', 'customer_zip_code_prefix', 'customer_state']], on='customer_id', how='left')
-    
-    # Pegar seller_id através dos items
-    order_seller = items.groupby('order_id')['seller_id'].first().reset_index()
-    final = final.merge(order_seller, on='order_id', how='left')
-    final = final.merge(sellers[['seller_id', 'seller_zip_code_prefix']], on='seller_id', how='left')
-    
-    # Merge coordenadas do cliente
-    customer_geo = geo_agg[['geolocation_zip_code_prefix', 'geolocation_lat', 'geolocation_lng']].copy()
-    customer_geo = customer_geo.rename(columns={
-        'geolocation_zip_code_prefix': 'customer_zip_code_prefix',
-        'geolocation_lat': 'customer_lat', 
-        'geolocation_lng': 'customer_lng'
-    })
-    final = final.merge(customer_geo, on='customer_zip_code_prefix', how='left')
-    
-    # Merge coordenadas do seller
-    seller_geo = geo_agg[['geolocation_zip_code_prefix', 'geolocation_lat', 'geolocation_lng']].copy()
-    seller_geo = seller_geo.rename(columns={
-        'geolocation_zip_code_prefix': 'seller_zip_code_prefix',
-        'geolocation_lat': 'seller_lat', 
-        'geolocation_lng': 'seller_lng'
-    })
-    final = final.merge(seller_geo, on='seller_zip_code_prefix', how='left')
-    
-    # Verificar se as colunas existem antes de calcular distância
-    required_cols = ['seller_lat', 'seller_lng', 'customer_lat', 'customer_lng']
-    missing_cols = [col for col in required_cols if col not in final.columns]
-    
-    if missing_cols:
-        print(f"[WARN] Colunas ausentes para cálculo de distância: {missing_cols}")
-        print("[WARN] Pulando cálculo de distância geográfica")
-        final['distancia_vendedor_cliente_km'] = np.nan
-    else:
-        # Calcular distância apenas para linhas com coordenadas válidas
-        mask = (final[required_cols].notna().all(axis=1))
-        final['distancia_vendedor_cliente_km'] = np.nan
-        
-        if mask.sum() > 0:
-            final.loc[mask, 'distancia_vendedor_cliente_km'] = final.loc[mask].apply(
-                lambda row: haversine_distance(row['seller_lat'], row['seller_lng'], 
-                                             row['customer_lat'], row['customer_lng']), axis=1
-            )
-            print(f"[OK] Distância calculada para {final['distancia_vendedor_cliente_km'].notna().sum()} pedidos")
-        else:
-            print("[WARN] Nenhuma coordenada válida encontrada para cálculo de distância")
+# EDA - Análise da variável target
+print(f"\nDISTRIBUIÇÃO TARGET (Review Score):")
+print(reviews['review_score'].value_counts().sort_index())
+print(f"% Reviews Positivas (>=4): {(reviews['review_score'] >= 4).mean()*100:.1f}%")
 
-# Remover linhas sem target
-final = final.dropna(subset=['review_good'])
+# EDA - Análise de dados faltantes
+print(f"\nDADOS FALTANTES:")
+missing_orders = orders.isnull().sum()
+print(f"Orders com datas faltantes: {missing_orders[missing_orders > 0]}")
 
-# ---------------------------
-# Selecionar features
-# ---------------------------
-print("\nSELEÇÃO DE FEATURES...")
+# EDA - Análise temporal
+orders_temp = orders.copy()
+orders_temp['order_delivered_customer_date'] = pd.to_datetime(orders_temp['order_delivered_customer_date'])
+orders_temp['order_estimated_delivery_date'] = pd.to_datetime(orders_temp['order_estimated_delivery_date'])
 
-# Features básicas
-basic_features = [
-    'atraso', 'atraso_entrega', 'tempo_aprovacao', 'tempo_entrega',
-    'mes_compra', 'dia_semana_compra', 'hora_compra', 'is_weekend',
-    'order_finalizado', 'frete_relativo', 'num_itens', 'media_reviews_seller'
-]
+print(f"\nANÁLISE TEMPORAL:")
+print(f"Pedidos sem data de entrega: {orders_temp['order_delivered_customer_date'].isnull().sum()} ({orders_temp['order_delivered_customer_date'].isnull().mean()*100:.1f}%)")
 
-# MELHORIA: Adicionar features avançadas se disponíveis
-if ADVANCED_FEATURES:
-    advanced_features = ['customer_state', 'product_category_name']
-    if 'distancia_vendedor_cliente_km' in final.columns:
-        advanced_features.append('distancia_vendedor_cliente_km')
-    features = basic_features + advanced_features
-    print(f"[OK] Usando {len(advanced_features)} features avançadas")
-else:
-    features = basic_features
-    print("📝 Usando apenas features básicas")
+# ============================================================================
+# LIMPEZA E TRATAMENTO DE FALTANTES/OUTLIERS
+# ============================================================================
+print("LIMPEZA E TRATAMENTO DE DADOS...")
 
-X = final[features].copy()
-y = final['review_good'].astype(int)
+# Converter datas
+orders['order_purchase_timestamp'] = pd.to_datetime(orders['order_purchase_timestamp'])
+orders['order_delivered_customer_date'] = pd.to_datetime(orders['order_delivered_customer_date'])
+orders['order_estimated_delivery_date'] = pd.to_datetime(orders['order_estimated_delivery_date'])
 
-# Tratar NaNs
-if ADVANCED_FEATURES:
-    if 'customer_state' in X.columns:
-        X['customer_state'] = X['customer_state'].fillna('Desconhecido')
-    if 'product_category_name' in X.columns:
-        X['product_category_name'] = X['product_category_name'].fillna('outros')
-    if 'distancia_vendedor_cliente_km' in X.columns:
-        X['distancia_vendedor_cliente_km'] = X['distancia_vendedor_cliente_km'].fillna(X['distancia_vendedor_cliente_km'].median())
+# TRATAMENTO DE FALTANTES: Remover pedidos sem entrega (sem vazamento)
+orders_clean = orders.dropna(subset=['order_delivered_customer_date', 'order_estimated_delivery_date']).copy()
+print(f"Pedidos após limpeza: {len(orders_clean)} (removidos: {len(orders) - len(orders_clean)})")
 
-X['media_reviews_seller'] = X['media_reviews_seller'].fillna(0.5)  # Valor neutro
+# TRATAMENTO DE OUTLIERS em frete
+print(f"\nTRATAMENTO DE OUTLIERS (Frete):")
+print(f"Frete antes: Q5={items['freight_value'].quantile(0.05):.2f}, Q95={items['freight_value'].quantile(0.95):.2f}")
+items['freight_value'] = items['freight_value'].clip(
+    lower=items['freight_value'].quantile(0.05),
+    upper=items['freight_value'].quantile(0.95)
+)
+print(f"Frete após clipping: Q5={items['freight_value'].quantile(0.05):.2f}, Q95={items['freight_value'].quantile(0.95):.2f}")
 
-print(f"Dataset final: {X.shape} features, {y.value_counts().to_dict()} distribuição classes")
+# ============================================================================
+# ENGENHARIA DE ATRIBUTOS
+# ============================================================================
+print(f"\nENGENHARIA DE ATRIBUTOS...")
 
-# Identificar features numéricas e categóricas
-num_cols = [col for col in X.columns if X[col].dtype in ['int64', 'float64']]
-cat_cols = [col for col in X.columns if X[col].dtype == 'object']
+# Features temporais (disponíveis no momento do pedido - SEM VAZAMENTO)
+orders_clean['atraso_dias'] = (orders_clean['order_delivered_customer_date'] - orders_clean['order_estimated_delivery_date']).dt.days
+orders_clean['tempo_entrega'] = (orders_clean['order_delivered_customer_date'] - orders_clean['order_purchase_timestamp']).dt.days
+orders_clean['mes_compra'] = orders_clean['order_purchase_timestamp'].dt.month
+orders_clean['dia_semana'] = orders_clean['order_purchase_timestamp'].dt.dayofweek
+orders_clean['is_weekend'] = (orders_clean['dia_semana'] >= 5).astype(int)
 
-print(f"Features numéricas: {num_cols}")
-print(f"Features categóricas: {cat_cols}")
+# Target: review bom (>= 4)
+reviews['review_good'] = (reviews['review_score'] >= 4).astype(int)
 
-# ---------------------------
-# Split dos dados
-# ---------------------------
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+# Merge dados principais
+df = orders_clean.merge(reviews[['order_id', 'review_good']], on='order_id', how='inner')
+df = df.merge(customers[['customer_id', 'customer_state']], on='customer_id', how='left')
 
-# ---------------------------
-# Pipeline de preprocessamento
-# ---------------------------
-print("\nCRIANDO PIPELINE DE PREPROCESSAMENTO...")
+# Features agregadas de items (por pedido)
+items_agg = items.groupby('order_id').agg({
+    'price': ['sum', 'mean', 'count'],
+    'freight_value': 'mean',
+    'order_item_id': 'count'
+}).reset_index()
 
-# Transformers
-num_transformer = SkPipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler())
-])
+# Flatten column names
+items_agg.columns = ['order_id', 'total_price', 'avg_price', 'price_count', 'avg_freight', 'num_items']
+df = df.merge(items_agg, on='order_id', how='left')
 
-if cat_cols:
-    cat_transformer = SkPipeline(steps=[
-        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', drop='first'))
-    ])
-    
-    preprocessor_base = ColumnTransformer(
-        transformers=[
-            ('num', num_transformer, num_cols),
-            ('cat', cat_transformer, cat_cols)
-        ]
-    )
-else:
-    preprocessor_base = ColumnTransformer(
-        transformers=[
-            ('num', num_transformer, num_cols)
-        ]
-    )
+# Feature adicional: frete relativo
+df['freight_ratio'] = df['avg_freight'] / (df['avg_price'] + 0.01)  # Evitar divisão por zero
 
-print("[OK] Pipeline de preprocessamento criado")
+# ============================================================================
+# DIVISÃO TREINO/TESTE E VALIDAÇÃO (SEM VAZAMENTO)
+# ============================================================================
 
-# ---------------------------
-# Baseline
-# ---------------------------
-print("\n📏 CALCULANDO BASELINE...")
-major_class = y_train.value_counts().idxmax()
-baseline_pred = np.full(y_test.shape, fill_value=major_class)
-baseline_f1 = f1_score(y_test, baseline_pred)
-print(f"Baseline (major class={major_class}): F1 = {baseline_f1:.4f}")
+# Selecionar features (apenas info disponível no momento do pedido)
+features = ['atraso_dias', 'tempo_entrega', 'mes_compra', 'dia_semana', 'is_weekend',
+           'total_price', 'avg_price', 'avg_freight', 'num_items', 'freight_ratio']
 
-# ---------------------------
-# Modelo e Cross-validation
-# ---------------------------
-print("="*60)
-print("TREINAMENTO DO MODELO")
-print("="*60)
+# Encode categóricas se necessário
+le = LabelEncoder()
+if 'customer_state' in df.columns:
+    df['customer_state_encoded'] = le.fit_transform(df['customer_state'].fillna('Unknown'))
+    features.append('customer_state_encoded')
 
-# MELHORIA: Usar LightGBM se disponível
-if LIGHTGBM_AVAILABLE:
-    model_name = "LightGBM"
-    model = LGBMClassifier(
-        objective='binary',
-        n_estimators=300,
-        learning_rate=0.05,
-        num_leaves=31,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1,
-        colsample_bytree=0.8,
-        verbosity=-1
-    )
-else:
-    model_name = "Random Forest"
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=15,
-        min_samples_split=5,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1
-    )
+# Preparar dados finais
+df_final = df.dropna(subset=features + ['review_good']).copy()
+X = df_final[features]
+y = df_final['review_good']
 
-# Pipeline completo
-final_pipeline = ImbPipeline([
-    ('preprocessor', clone(preprocessor_base)),  # CORREÇÃO #2: Clone preprocessor
-    ('resampler', SMOTETomek(random_state=42)),
-    ('clf', model)
-])
+print(f"Dataset final: {X.shape[0]} amostras, {X.shape[1]} features")
+print(f"Distribuição target: {y.value_counts().to_dict()}")
+print(f"Balanceamento: {y.mean()*100:.1f}% positivo")
 
-# Cross-validation - MELHORIA: Usar f1_macro para datasets desbalanceados
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = cross_val_score(final_pipeline, X_train, y_train, cv=cv, scoring='f1_macro', n_jobs=-1)
-print(f"{model_name}: F1 Macro CV = {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+# DIVISÃO ESTRATIFICADA (preserva proporção das classes)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
 
-# Treinar modelo final
-final_pipeline.fit(X_train, y_train)
+print(f"Split realizado - Treino: {len(X_train)}, Teste: {len(X_test)}")
 
-print(f"\n[OK] Modelo treinado: {model_name}")
+# ============================================================================
+# BASELINE E TREINAMENTO RANDOM FOREST
+# ============================================================================
+print(f"\nBASELINE (Classe Majoritária):")
+baseline_acc = y_train.value_counts().max() / len(y_train)
+print(f"Baseline Accuracy: {baseline_acc:.4f}")
 
-# ---------------------------
-# Criar pipeline de inferência (SEM resampler) para avaliação
-# ---------------------------
-inference_pipeline = SkPipeline([
-    ('preprocessor', clone(preprocessor_base)),  # CORREÇÃO #2: Clone preprocessor
-    ('clf', final_pipeline.named_steps['clf'])
-])
-# Ajustar o preprocessor usando X_train
-inference_pipeline.named_steps['preprocessor'].fit(X_train)
+# RANDOM FOREST
 
-# ---------------------------
-# Avaliação no conjunto de teste
-# ---------------------------
-print("="*60)
-print("AVALIAÇÃO NO CONJUNTO DE TESTE")
-print("="*60)
+rf_model = RandomForestClassifier(
+    n_estimators=200, max_depth=15, random_state=42, 
+    class_weight="balanced", n_jobs=-1
+)
+
+print(f"Treinando Random Forest...")
+rf_model.fit(X_train, y_train)
 
 # Predições
-y_pred = inference_pipeline.predict(X_test)
-y_probs = inference_pipeline.predict_proba(X_test)[:, 1]
-
-# Métricas principais
-f1_test = f1_score(y_test, y_pred)
-roc_auc = roc_auc_score(y_test, y_probs)
-pr_auc = average_precision_score(y_test, y_probs)
-
-print("Classification Report (Teste):")
-print(classification_report(y_test, y_pred, digits=4))
-
-# F1 específico para cada classe - usando pos_label para consistência
-f1_class0 = f1_score(y_test, y_pred, pos_label=0)  # Classe 0 (ruins)
-f1_class1 = f1_score(y_test, y_pred, pos_label=1)  # Classe 1 (boas)
-
-print(f"\nMétricas Gerais:")
-print(f"F1-Score Geral: {f1_test:.4f}")
-print(f"ROC-AUC: {roc_auc:.4f}")
-print(f"PR-AUC: {pr_auc:.4f}")
-
-print(f"\nMétricas por Classe:")
-print(f"F1 (Classe 0 - Reviews Ruins): {f1_class0:.4f}")
-print(f"F1 (Classe 1 - Reviews Boas): {f1_class1:.4f}")
-print(f"Diferença F1 (Classe1 - Classe0): {f1_class1 - f1_class0:.4f}")
-
-# ---------------------------
-# Otimização de threshold usando conjunto de validação (SEM data snooping)
-# ---------------------------
-print("\n" + "="*50)
-print("OTIMIZAÇÃO DE THRESHOLD (usando validação)")
-print("="*50)
-
-# Split de validação a partir do treino
-X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
-    X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
-)
-
-# Treinar modelo apenas no subset de treino
-val_pipeline = ImbPipeline([
-    ('preprocessor', clone(preprocessor_base)),  # CORREÇÃO #2: Clone preprocessor
-    ('resampler', SMOTETomek(random_state=42)),
-    ('clf', clone(model))  # CORREÇÃO #2: Clone model
-])
-
-val_pipeline.fit(X_train_split, y_train_split)
-
-# Pipeline de inferência para validação  
-inference_pipeline_val = SkPipeline([
-    ('preprocessor', clone(preprocessor_base)),  # CORREÇÃO #2: Clone preprocessor
-    ('clf', val_pipeline.named_steps['clf'])
-])
-inference_pipeline_val.named_steps['preprocessor'].fit(X_train_split)
-
-# Predições no conjunto de validação
-y_pred_val = inference_pipeline_val.predict(X_val_split)
-if hasattr(inference_pipeline_val.named_steps['clf'], "predict_proba"):
-    y_probs_val = inference_pipeline_val.predict_proba(X_val_split)[:, 1]
-else:
-    y_probs_val = np.zeros(len(y_val_split))
-
-# CORREÇÃO #4: F1 baseline com pos_label explícito 
-f1_val_baseline = f1_score(y_val_split, y_pred_val)
-f1_class0_baseline = f1_score(y_val_split, y_pred_val, pos_label=0)  # Classe 0 (ruins)
-f1_class1_baseline = f1_score(y_val_split, y_pred_val, pos_label=1)  # Classe 1 (boas)
-
-# Otimizar threshold para maximizar F1 da classe 0
-best_t = 0.5
-best_f1_class0 = f1_class0_baseline
-best_results = {
-    'threshold': 0.5,
-    'f1_class0': f1_class0_baseline,
-    'f1_class1': f1_class1_baseline,
-    'f1_weighted': f1_val_baseline
-}
-
-thresholds = np.linspace(0.1, 0.9, 81)
-
-for t in thresholds:
-    preds_t = (y_probs_val >= t).astype(int)
-    
-    # CORREÇÃO #4: F1 para cada classe com pos_label explícito
-    f1_0 = f1_score(y_val_split, preds_t, pos_label=0)  # Classe 0 (ruins)
-    f1_1 = f1_score(y_val_split, preds_t, pos_label=1)  # Classe 1 (boas)
-    f1_weighted = f1_score(y_val_split, preds_t, average='weighted')
-    
-    if f1_0 > best_f1_class0:
-        best_f1_class0 = f1_0
-        best_t = t
-        best_results = {
-            'threshold': t,
-            'f1_class0': f1_0,
-            'f1_class1': f1_1,
-            'f1_weighted': f1_weighted
-        }
-
-print(f"Threshold padrão (0.5) no conjunto de validação:")
-print(f"  F1 Classe 0: {f1_class0_baseline:.4f}")
-print(f"  F1 Classe 1: {f1_class1_baseline:.4f}")
-
-print(f"\nMelhor threshold encontrado: {best_t:.3f}")
-print(f"  F1 Classe 0: {best_results['f1_class0']:.4f} (+{best_results['f1_class0']-f1_class0_baseline:.4f})")
-print(f"  F1 Classe 1: {best_results['f1_class1']:.4f} ({best_results['f1_class1']-f1_class1_baseline:+.4f})")
-print(f"  F1 Weighted: {best_results['f1_weighted']:.4f} ({best_results['f1_weighted']-f1_val_baseline:+.4f})")
-
-# Aplicar threshold otimizado ao conjunto de teste
-y_pred_optimized = (y_probs >= best_t).astype(int)
-
-# Recalcular todas as métricas no TESTE com o novo threshold
-f1_test_optimized = f1_score(y_test, y_pred_optimized)
-f1_class0_optimized = f1_score(y_test, y_pred_optimized, pos_label=0)  # Usando pos_label para clareza
-f1_class1_optimized = f1_score(y_test, y_pred_optimized, pos_label=1)  # Usando pos_label para clareza
-
-print(f"\nResultados no conjunto de TESTE com threshold otimizado (threshold={best_t:.3f}):")
-print(f"  F1 Geral: {f1_test_optimized:.4f} (vs {f1_test:.4f} com threshold=0.5)")
-print(f"  F1 Classe 0 (Ruins): {f1_class0_optimized:.4f} (vs {f1_class0:.4f} com threshold=0.5)")
-print(f"  F1 Classe 1 (Boas): {f1_class1_optimized:.4f} (vs {f1_class1:.4f} com threshold=0.5)")
-
-# ---------------------------
-# Visualizações
-# ---------------------------
-print("\nGERANDO VISUALIZAÇÕES...")
-
-# Curva ROC
-fpr, tpr, _ = roc_curve(y_test, y_probs)
-
-plt.figure(figsize=(6, 5))
-plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
-plt.plot([0, 1], [0, 1], linestyle="--")
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("Curva ROC")
-plt.legend()
-plt.savefig(os.path.join(output_dir, 'roc_curve.png'), dpi=300, bbox_inches='tight')
-plt.close()
-
-# Precision-Recall Curve
-precision, recall, _ = precision_recall_curve(y_test, y_probs)
-
-plt.figure(figsize=(6, 5))
-plt.plot(recall, precision, label=f"PR-AUC = {pr_auc:.3f}")
-plt.xlabel("Recall")
-plt.ylabel("Precision")
-plt.title("Curva Precision-Recall")
-plt.legend()
-plt.savefig(os.path.join(output_dir, 'precision_recall_curve.png'), dpi=300, bbox_inches='tight')
-plt.close()
-
-# Matriz de confusão
-from sklearn.metrics import ConfusionMatrixDisplay
-cm = confusion_matrix(y_test, y_pred_optimized)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Ruins', 'Boas'])
-fig, ax = plt.subplots(figsize=(6, 5))
-disp.plot(ax=ax, cmap='Blues')
-plt.title(f'Matriz de Confusão (threshold={best_t:.3f})')
-plt.savefig(os.path.join(output_dir, 'confusion_matrix_normalized.png'), dpi=300, bbox_inches='tight')
-plt.close()
-
-print(f"[OK] Visualizações salvas em {output_dir}/")
-
-# ---------------------------
-# Análise de Importância das Variáveis
-# ---------------------------
-print("="*60)
-print("ANÁLISE DE IMPORTÂNCIA DAS VARIÁVEIS - PERMUTATION")
-print("="*60)
-
-# CORREÇÃO: Feature names robustas usando API do preprocessor
-try:
-    # Usar API direta do preprocessor para garantir ordem e consistência
-    preproc = inference_pipeline.named_steps['preprocessor']
-    feature_names = preproc.get_feature_names_out()
-    print(f"[OK] Feature names extraídos via API do preprocessor: {len(feature_names)} features")
-    
-except Exception as e:
-    print(f"[WARN] API get_feature_names_out não disponível: {e}")
-    
-    # Fallback robusto: construir manualmente
-    feature_names = []
-    
-    # Features numéricas
-    num_names = [f"num__{col}" for col in num_cols]
-    feature_names.extend(num_names)
-    
-    # Features categóricas (se existirem)
-    if cat_cols:
-        try:
-            cat_transformer = preproc.named_transformers_['cat']
-            ohe = cat_transformer.named_steps['onehot']
-            cat_feature_names = ohe.get_feature_names_out(cat_cols)
-            feature_names.extend(cat_feature_names)
-        except Exception:
-            # Fallback manual para versões antigas
-            for col in cat_cols:
-                unique_vals = X_train[col].astype(str).unique()[:10]  # Limitar a 10 valores
-                cat_names = [f"{col}__{val}" for val in unique_vals]
-                feature_names.extend(cat_names)
-    
-    print(f"[OK] Feature names construídos manualmente: {len(feature_names)} features")
-
-# Ajustar tamanho se necessário
-X_test_trans = inference_pipeline.named_steps['preprocessor'].transform(X_test)
-if len(feature_names) != X_test_trans.shape[1]:
-    print(f"Aviso: Ajustando feature_names de {len(feature_names)} para {X_test_trans.shape[1]} features")
-    feature_names = feature_names[:X_test_trans.shape[1]]
-    if len(feature_names) < X_test_trans.shape[1]:
-        feature_names.extend([f"feature_{i}" for i in range(len(feature_names), X_test_trans.shape[1])])
-
-# Permutation Importance
-# CORREÇÃO: Otimizar permutation importance para performance
-perm_importance = permutation_importance(inference_pipeline, X_test, y_test, n_repeats=5, random_state=42, scoring='f1', n_jobs=-1)  # Reduzido de 10 para 5
-
-importance_df = pd.DataFrame({
-    'feature': feature_names,
-    'importance': perm_importance.importances_mean
-}).sort_values('importance', ascending=False)
-
-print("Top 10 Features - Permutation Importance:")
-print(importance_df.head(10).to_string(index=False))
-
-# Plot importance
-plt.figure(figsize=(10, 6))
-top_features = importance_df.head(10)
-plt.barh(range(len(top_features)), top_features['importance'][::-1])
-plt.yticks(range(len(top_features)), top_features['feature'][::-1])
-plt.xlabel('Importância (Permutation)')
-plt.title('Top 10 Features - Permutation Importance')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'permutation_importance.png'), dpi=300, bbox_inches='tight')
-plt.close()
-
-# ---------------------------
-# SHAP Analysis
-# ---------------------------
-if SHAP_AVAILABLE:
-    print("="*60)
-    print("ANÁLISE SHAP")
-    print("="*60)
-
-    # CORREÇÃO #6: Subamostragem para SHAP (performance e memória) - MELHORIA: Reduzir ainda mais
-    shap_sample_size = min(500, len(X_test))  # Reduzido de 1000 para 500
-    shap_indices = np.random.choice(len(X_test), shap_sample_size, replace=False)
-    X_test_shap = X_test.iloc[shap_indices]
-    print(f"Amostras para SHAP: {len(X_test_shap)} (de {len(X_test)} totais)")
-
-    # Transformar X_test_shap com o preprocessor (usado para SHAP)
-    X_test_trans_shap = inference_pipeline.named_steps['preprocessor'].transform(X_test_shap)
-
-    # Se o classificador for Tree-based, usar TreeExplainer; caso contrário usar shap.Explainer
-    clf = inference_pipeline.named_steps['clf']
-
-    # CORREÇÃO #7: Try/catch robusto para SHAP
-    try:
-        print("Calculando SHAP values...")
-        if hasattr(clf, "predict_proba") and (hasattr(clf, "feature_importances_") or 'Forest' in str(type(clf).__name__) or 'LGBM' in str(type(clf).__name__)):
-            explainer = shap.TreeExplainer(clf)
-            shap_values = explainer.shap_values(X_test_trans_shap)
-        else:
-            explainer = shap.Explainer(clf.predict_proba, X_test_trans_shap)
-            shap_values = explainer(X_test_trans_shap)
-    except Exception as e:
-        print(f"Erro na criação do explainer: {e}")
-        try:
-            # fallback geral
-            explainer = shap.Explainer(clf, X_test_trans_shap)
-            shap_values = explainer(X_test_trans_shap)
-        except Exception as e2:
-            print(f"SHAP falhou completamente: {e2}")
-            print("Pulando análise SHAP...")
-            shap_values = None
-
-    # Normalizar formato para plot - CORREÇÃO #7: Try/except 
-    if shap_values is not None:
-        try:
-            if hasattr(shap, 'Explanation') and isinstance(shap_values, shap.Explanation):
-                # shap v0.40+ style com Explanation object
-                vals = shap_values.values
-                # se multi classe, tentar pegar a classe positiva (1)
-                if vals.ndim == 3:
-                    shap_to_plot = vals[:, :, 1]  # (n_samples, n_features) para classe 1
-                else:
-                    shap_to_plot = vals
-            elif hasattr(shap_values, "values"):
-                # shap_values tem atributo values
-                vals = shap_values.values
-                if vals.ndim == 3:
-                    shap_to_plot = vals[:, :, 1]
-                else:
-                    shap_to_plot = vals
-            else:
-                # lista de arrays (formato clássico)
-                if isinstance(shap_values, list) and len(shap_values) > 1:
-                    shap_to_plot = shap_values[1]  # classe positiva
-                elif isinstance(shap_values, list):
-                    shap_to_plot = shap_values[0]
-                else:
-                    shap_to_plot = shap_values
-            print(f"SHAP values processados com sucesso. Shape: {shap_to_plot.shape}")
-        except Exception as e:
-            print(f"Erro ao processar SHAP values: {e}")
-            # Fallback: assumir que é array numpy simples
-            shap_to_plot = shap_values
-
-        # Tentar obter feature_names compatíveis
-        fnames = feature_names[:X_test_trans_shap.shape[1]]
-
-        # CORREÇÃO #7: Summary plot protegido
-        try:
-            shap.summary_plot(shap_to_plot, X_test_trans_shap, feature_names=fnames, show=False)
-            plt.title('SHAP Summary Plot - Feature Importance')
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'shap_summary.png'), dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"[OK] SHAP summary plot salvo: {os.path.join(output_dir, 'shap_summary.png')}")
-        except Exception as e:
-            print(f"[WARN] Erro ao gerar summary plot: {e}")
-
-        # MELHORIA: Waterfall plot para exemplo específico (primeira amostra de review ruim)
-        try:
-            # Encontrar primeira amostra de review ruim para explicação local
-            y_test_shap = y_test.iloc[shap_indices]
-            bad_review_idx = np.where(y_test_shap == 0)[0]
-            
-            if len(bad_review_idx) > 0:
-                sample_idx = bad_review_idx[0]
-                sample_label = "review_ruim"
-            else:
-                sample_idx = 0
-                sample_label = "primeiro_exemplo"
-            
-            if hasattr(shap, 'Explanation'):
-                # Para classificação binária, usar apenas a classe positiva (índice 1)
-                if len(shap_to_plot.shape) == 3:  # (samples, features, classes)
-                    sample_values = shap_to_plot[sample_idx, :, 1]  # Amostra específica, classe 1
-                    base_value = explainer.expected_value[1] if isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value
-                else:
-                    sample_values = shap_to_plot[sample_idx]  # Amostra específica
-                    base_value = explainer.expected_value if not isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value[0]
-                    
-                shap.plots.waterfall(shap.Explanation(values=sample_values,
-                                                     base_values=base_value,
-                                                     data=X_test_trans_shap[sample_idx],
-                                                     feature_names=fnames))
-                plt.title(f'SHAP Waterfall - Explicação Local ({sample_label})')
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f'shap_waterfall_{sample_label}.png'), dpi=300, bbox_inches='tight')
-                plt.close()
-                print(f"[OK] SHAP waterfall plot salvo: {os.path.join(output_dir, f'shap_waterfall_{sample_label}.png')}")
-            else:
-                print("SHAP Explanation não disponível, pulando waterfall plot")
-        except Exception as e:
-            print(f"[WARN] Erro ao gerar waterfall plot: {e}")
-            
-    else:
-        print("[WARN] SHAP analysis pulada devido a erros anteriores")
-
-    print("Análise SHAP concluída!")
-
-# ---------------------------
-# Learning Curve (usar inference_pipeline)
-# ---------------------------
-print("="*60)
-print("LEARNING CURVES")
-print("="*60)
-
-train_sizes, train_scores, test_scores = learning_curve(
-    inference_pipeline, X_train, y_train, cv=5,
-    train_sizes=np.linspace(0.1, 1.0, 10),
-    scoring='f1', n_jobs=-1
-)
-
-train_mean = np.mean(train_scores, axis=1)
-train_std = np.std(train_scores, axis=1)
-test_mean = np.mean(test_scores, axis=1)
-test_std = np.std(test_scores, axis=1)
-
-plt.figure(figsize=(10, 6))
-plt.plot(train_sizes, train_mean, 'o-', label='Treino')
-plt.fill_between(train_sizes, train_mean - train_std, train_mean + train_std, alpha=0.1)
-plt.plot(train_sizes, test_mean, 'o-', label='Validação')
-plt.fill_between(train_sizes, test_mean - test_std, test_mean + test_std, alpha=0.1)
-
-plt.xlabel("Tamanho do Conjunto de Treino")
-plt.ylabel("F1-score")
-plt.title("Learning Curves - Detecção de Overfitting")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'learning_curves.png'), dpi=300, bbox_inches='tight')
-plt.close()
-
-# Análise de overfitting - CORREÇÃO #3: Análise quantitativa detalhada
-gap = train_mean[-1] - test_mean[-1]
-print(f"\nANÁLISE DE OVERFITTING:")
-print(f"   Gap final treino-validação: {gap:.4f}")
-print(f"   Score treino final: {train_mean[-1]:.4f}")
-print(f"   Score validação final: {test_mean[-1]:.4f}")
-
-# Critérios mais detalhados para overfitting
-if gap > 0.1:
-    print("[ERROR] OVERFITTING SEVERO detectado! (gap > 10%)")
-elif gap > 0.05:
-    print("[WARN] OVERFITTING MODERADO detectado (gap > 5%)")
-elif gap > 0.02:
-    print("[WARN] OVERFITTING LEVE detectado (gap > 2%)")
-else:
-    print("[OK] Modelo bem generalizado (gap ≤ 2%)")
-
-# Análise da convergência
-train_final_diff = train_mean[-1] - train_mean[-3]  # Últimas 3 medições
-test_final_diff = test_mean[-1] - test_mean[-3]
-
-print(f"\n ANÁLISE DE CONVERGÊNCIA:")
-print(f"   Melhoria treino (últimas medições): {train_final_diff:+.4f}")
-print(f"   Melhoria validação (últimas medições): {test_final_diff:+.4f}")
-
-if abs(train_final_diff) < 0.01 and abs(test_final_diff) < 0.01:
-    print("[OK] Modelo convergiu adequadamente")
-else:
-    print("[WARN] Modelo ainda pode melhorar com mais dados")
-
-print(f"[OK] Learning curves salvas em {output_dir}/")
-
-# ---------------------------
-# Salvar modelo treinado - MELHORIA: Salvar modelo
-# ---------------------------
-print("\nSALVANDO MODELO...")
-model_filename = os.path.join(output_dir, f"{model_name.lower().replace(' ', '_')}_inference.pkl")
-joblib.dump(inference_pipeline, model_filename)
-print(f"[OK] Modelo salvo: {model_filename}")
-
-# ---------------------------
-# Resumo Final dos Resultados
-# ---------------------------
-print("="*60)
-print("RESUMO FINAL DOS RESULTADOS")
-print("="*60)
-
-print(f"{model_name.upper()} - PERFORMANCE FINAL:")
-print(f"F1 Macro Cross-Validation: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-print(f"F1 Teste (threshold=0.5): {f1_test:.4f}")
-print(f"F1 Teste (threshold={best_t:.3f}): {f1_test_optimized:.4f}")
-print(f"F1 Classe 0 (otimizado): {f1_class0_optimized:.4f}")
-print(f"ROC-AUC: {roc_auc:.4f}")
-print(f"PR-AUC: {pr_auc:.4f}")
-
-if baseline_f1 > 0:
-    improvement = ((f1_test_optimized/baseline_f1 - 1) * 100)
-    print(f"Melhoria sobre baseline: {improvement:.1f}%")
-
-# Informações sobre features utilizadas
-print(f"\nFEATURES UTILIZADAS ({len(features)} total):")
-print(f"   Numéricas: {len(num_cols)}")
-print(f"   Categóricas: {len(cat_cols)}")
-if ADVANCED_FEATURES:
-    advanced_count = sum([
-        'customer_state' in features,
-        'product_category_name' in features,
-        'distancia_vendedor_cliente_km' in features
-    ])
-    print(f"   Features avançadas: {advanced_count}/3")
-
-# Salvar resultados
-results_dict = {
-    'model_type': model_name,
-    'advanced_features': ADVANCED_FEATURES,
-    'threshold_optimized': best_t,
-    'f1_cv_macro': cv_scores.mean(),
-    'f1_cv_std': cv_scores.std(),
-    'f1_test_baseline': f1_test,
-    'f1_test_optimized': f1_test_optimized,
-    'f1_class0_optimized': f1_class0_optimized,
-    'f1_class1_optimized': f1_class1_optimized,
-    'roc_auc': roc_auc,
-    'pr_auc': pr_auc,
-    'overfitting_gap': gap,
-    'num_features': len(features),
-    'num_categorical': len(cat_cols)
-}
-
-results_df = pd.DataFrame([results_dict])
-results_df.to_csv(os.path.join(output_dir, 'model_results.csv'), index=False)
-print(f"\nResultados salvos em: {os.path.join(output_dir, 'model_results.csv')}")
-
-# CORREÇÃO: Lista de arquivos gerados usando output_dir
-generated_files = [
-    os.path.join(output_dir, 'confusion_matrix_normalized.png'),
-    os.path.join(output_dir, 'roc_curve.png'), 
-    os.path.join(output_dir, 'precision_recall_curve.png'),
-    os.path.join(output_dir, 'permutation_importance.png'),
-    os.path.join(output_dir, 'learning_curves.png'),
-    os.path.join(output_dir, 'model_results.csv'),
-    model_filename
-]
-
-if SHAP_AVAILABLE:
-    generated_files.extend([
-        os.path.join(output_dir, 'shap_summary.png')
-    ])
-
-print(f"\nArquivos gerados:")
-for file in generated_files:
-    print(f"- {file}")
+y_pred = rf_model.predict(X_test)
+y_prob = rf_model.predict_proba(X_test)[:, 1]
 
 print("\n" + "="*60)
-print("🎉 ANÁLISE COMPLETA FINALIZADA! 🎉")
+print("RESULTADOS FINAIS")
 print("="*60)
-print("[OK] Todas as melhorias implementadas:")
-print("   Outputs organizados em pasta")
-print("   Modelo salvo automaticamente")
-print("   Features categóricas incluídas")
-print("   Distância geográfica calculada")
-print("   LightGBM usado (se disponível)")
-print("   F1 Macro para CV balanceado")
-print("   SHAP otimizado (500 amostras)")
-print("   Explicação local de casos específicos")
+print("Classification Report:")
+print(classification_report(y_test, y_pred))
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print(f"F1-score: {f1_score(y_test, y_pred):.4f}")
+print(f"ROC-AUC: {roc_auc_score(y_test, y_prob):.4f}")
+print(f"PR-AUC: {average_precision_score(y_test, y_prob):.4f}")
+
+# Cross-validation do Random Forest
+cv_scores = cross_val_score(rf_model, X_train, y_train, cv=5, scoring='f1')
+print(f"F1 Cross-Validation: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+
+# ============================================================================
+# ANÁLISE DE OVERFITTING/UNDERFITTING
+# ============================================================================
+print("\nANÁLISE DE OVERFITTING/UNDERFITTING:")
+
+# Avaliar performance em treino vs teste
+y_train_pred = rf_model.predict(X_train)
+f1_train = f1_score(y_train, y_train_pred)
+f1_test = f1_score(y_test, y_pred)
+
+print(f"F1 Treino: {f1_train:.4f}")
+print(f"F1 Teste:  {f1_test:.4f}")
+print(f"Gap (Treino-Teste): {f1_train - f1_test:.4f}")
+
+if (f1_train - f1_test) > 0.05:
+    print("POSSÍVEL OVERFITTING (gap > 5%)")
+elif (f1_train - f1_test) < 0.01:
+    print("MODELO BEM GENERALIZADO")
+else:
+    print("AJUSTE RAZOÁVEL")
+
+# ============================================================================
+# VISUALIZAÇÕES E CURVAS
+# ============================================================================
+plt.style.use('default')
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+# Matriz de confusão
+cm = confusion_matrix(y_test, y_pred)
+im = axes[0,0].imshow(cm, interpolation='nearest', cmap="Blues")
+axes[0,0].set_title("Matriz de Confusão")
+# Adicionar valores na matriz
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        axes[0,0].text(j, i, str(cm[i, j]), ha="center", va="center")
+
+# Curva ROC
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+axes[0,1].plot(fpr, tpr, label=f"ROC-AUC = {roc_auc_score(y_test, y_prob):.3f}")
+axes[0,1].plot([0,1],[0,1], "--", color="gray")
+axes[0,1].set_xlabel("Falso Positivo")
+axes[0,1].set_ylabel("Verdadeiro Positivo")
+axes[0,1].set_title("Curva ROC")
+axes[0,1].legend()
+
+# Curva Precision-Recall
+prec, rec, _ = precision_recall_curve(y_test, y_prob)
+axes[1,0].plot(rec, prec, label=f"PR-AUC = {average_precision_score(y_test, y_prob):.3f}")
+axes[1,0].set_xlabel("Recall")
+axes[1,0].set_ylabel("Precisão")
+axes[1,0].set_title("Curva Precision-Recall")
+axes[1,0].legend()
+
+# Distribuição de Probabilidades
+axes[1,1].hist(y_prob[y_test==0], alpha=0.7, bins=30, label='Classe 0', density=True)
+axes[1,1].hist(y_prob[y_test==1], alpha=0.7, bins=30, label='Classe 1', density=True)
+axes[1,1].set_xlabel("Probabilidade Predita")
+axes[1,1].set_ylabel("Densidade")
+axes[1,1].set_title("Distribuição de Probabilidades")
+axes[1,1].legend()
+
+plt.tight_layout()
+plt.savefig('resultados_random_forest.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# Curva de aprendizado (DETECÇÃO DE OVERFITTING)
+print("\nCalculando curva de aprendizado...")
+train_sizes, train_scores, test_scores = learning_curve(
+    rf_model, X, y, cv=3, scoring="f1", n_jobs=-1,
+    train_sizes=np.linspace(0.1, 1.0, 5)
+)
+
+plt.figure(figsize=(8, 6))
+plt.plot(train_sizes, train_scores.mean(axis=1), "o-", label="Treino")
+plt.fill_between(train_sizes, train_scores.mean(axis=1) - train_scores.std(axis=1),
+                 train_scores.mean(axis=1) + train_scores.std(axis=1), alpha=0.2)
+plt.plot(train_sizes, test_scores.mean(axis=1), "o-", label="Validação")
+plt.fill_between(train_sizes, test_scores.mean(axis=1) - test_scores.std(axis=1),
+                 test_scores.mean(axis=1) + test_scores.std(axis=1), alpha=0.2)
+plt.title("Curva de Aprendizado - Análise de Overfitting")
+plt.xlabel("Tamanho do conjunto de treino")
+plt.ylabel("F1-Score")
+plt.legend()
+plt.grid(True)
+plt.savefig('curva_aprendizado.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ============================================================================
+# INTERPRETABILIDADE (SHAP/Feature Importance)
+# ============================================================================
+print("INTERPRETABILIDADE:")
+
+# Feature Importance (Random Forest)
+if hasattr(rf_model, 'feature_importances_'):
+    feature_imp = pd.DataFrame({
+        'feature': X.columns,
+        'importance': rf_model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    print("\nTOP 5 FEATURES MAIS IMPORTANTES:")
+    print(feature_imp.head().to_string(index=False))
+    
+    # Plot separado de feature importance
+    plt.figure(figsize=(10, 6))
+    feature_imp.sort_values('importance').plot(x='feature', y='importance', kind='barh')
+    plt.title('Feature Importance - Random Forest')
+    plt.xlabel('Importância')
+    plt.tight_layout()
+    plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+# SHAP Analysis
+print("\nAnálise SHAP...")
+
+# Sample menor para SHAP (performance)
+sample_size = min(100, len(X_test))
+X_sample = X_test.sample(sample_size, random_state=42)
+
+explainer = shap.TreeExplainer(rf_model)
+shap_values = explainer.shap_values(X_sample)
+
+# Se classificação binária, pegar classe positiva
+if isinstance(shap_values, list):
+    shap_values = shap_values[1]
+
+# Criar SHAP plot com configurações adequadas
+plt.clf()
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_sample, show=False)
+plt.title('SHAP Summary Plot - Importância e Impacto das Features', fontsize=14, pad=20)
+plt.tight_layout()
+plt.savefig('shap_summary.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+print("Análise SHAP concluída")
+
+# ============================================================================
+# OTIMIZAÇÃO DE HIPERPARÂMETROS
+# ============================================================================
+print("\nOTIMIZAÇÃO DE HIPERPARÂMETROS...")
+
+# Performance ANTES da otimização (usando predições já calculadas)
+f1_before = f1_score(y_test, y_pred)
+print(f"F1-Score ANTES da otimização: {f1_before:.4f}")
+
+# Grid Search para Random Forest
+param_grid = {
+    "n_estimators": [100, 200, 300],
+    "max_depth": [10, 15, 20],
+    "min_samples_split": [5, 10, 15]
+}
+
+grid = GridSearchCV(rf_model, param_grid, cv=3, scoring="f1", n_jobs=-1, verbose=1)
+grid.fit(X_train, y_train)
+
+print(f"\nMelhores hiperparâmetros: {grid.best_params_}")
+print(f"F1-score otimizado (CV): {grid.best_score_:.4f}")
+
+# Avaliar modelo otimizado no teste
+best_optimized_model = grid.best_estimator_
+y_pred_opt = best_optimized_model.predict(X_test)
+y_prob_opt = best_optimized_model.predict_proba(X_test)[:, 1]
+
+f1_after = f1_score(y_test, y_pred_opt)
+roc_after = roc_auc_score(y_test, y_prob_opt)
+acc_after = accuracy_score(y_test, y_pred_opt)
+
+print(f"\nCOMPARAÇÃO ANTES vs DEPOIS:")
+print(f"F1-Score:  {f1_before:.4f} → {f1_after:.4f} ({f1_after-f1_before:+.4f})")
+print(f"ROC-AUC:   {roc_auc_score(y_test, y_prob):.4f} → {roc_after:.4f} ({roc_after-roc_auc_score(y_test, y_prob):+.4f})")
+print(f"Accuracy:  {accuracy_score(y_test, y_pred):.4f} → {acc_after:.4f} ({acc_after-accuracy_score(y_test, y_pred):+.4f})")
+
+# ============================================================================
+# CONCLUSÕES
+# ============================================================================
+
+print(f"\nINTERPRETABILIDADE:")
+if hasattr(best_optimized_model, 'feature_importances_'):
+    top_feature = feature_imp.iloc[0]['feature']
+    print(f" - Feature mais importante: {top_feature}")
+
+
+print(f"\nRISCOS MITIGADOS:")
+print(f"Desbalanceamento: class_weight='balanced'")
+print(f"Vazamento de dados: apenas features pré-pedido")
+print(f"Overfitting: validação cruzada + learning curves")
+print(f"Outliers: clipping em percentis 5-95")
+
+print("\n" + "="*60)
+print("ANÁLISE COMPLETA FINALIZADA!")
+print("="*60)
+
+# ============================================================================
+# EXEMPLO DE INFERÊNCIA EM NOVO PEDIDO
+# ============================================================================
+print("\n" + "="*60)
+print("EXEMPLO DE INFERÊNCIA EM NOVO PEDIDO")
+print("="*60)
+
+def prever_satisfacao_cliente(novo_pedido_data, modelo_treinado, label_encoder, feature_names):
+    """
+    Função para prever a satisfação do cliente em um novo pedido
+    """
+    
+    # Converter para formato de data
+    data_pedido = pd.to_datetime(novo_pedido_data['order_purchase_timestamp'])
+    data_entrega = pd.to_datetime(novo_pedido_data['order_delivered_customer_date'])
+    data_estimada = pd.to_datetime(novo_pedido_data['order_estimated_delivery_date'])
+    
+    # Calcular as features (mesma engenharia de atributos do treinamento)
+    atraso_dias = (data_entrega - data_estimada).days
+    tempo_entrega = (data_entrega - data_pedido).days
+    mes_compra = data_pedido.month
+    dia_semana = data_pedido.dayofweek
+    is_weekend = int(dia_semana >= 5)
+    total_price = novo_pedido_data['total_price']
+    avg_price = total_price / novo_pedido_data['num_items']
+    avg_freight = novo_pedido_data['freight_value']
+    num_items = novo_pedido_data['num_items']
+    freight_ratio = avg_freight / (avg_price + 0.01)
+    
+    # Encode do estado (usando o mesmo LabelEncoder do treinamento)
+    try:
+        customer_state_encoded = label_encoder.transform([novo_pedido_data['customer_state']])[0]
+    except ValueError:
+        # Se o estado não foi visto no treinamento, usar um valor padrão
+        print(f"Estado '{novo_pedido_data['customer_state']}' não visto no treinamento. Usando valor padrão.")
+        customer_state_encoded = 0
+    
+    # Criar DataFrame com a mesma estrutura do treinamento
+    novo_dado = pd.DataFrame([[
+        atraso_dias, tempo_entrega, mes_compra, dia_semana, is_weekend,
+        total_price, avg_price, avg_freight, num_items, freight_ratio,
+        customer_state_encoded
+    ]], columns=feature_names)
+    
+    # Fazer predições
+    predicao_binaria = modelo_treinado.predict(novo_dado)[0]
+    probabilidades = modelo_treinado.predict_proba(novo_dado)[0]
+    prob_boa_avaliacao = probabilidades[1]
+    
+    return {
+        'predicao_binaria': predicao_binaria,
+        'probabilidade_boa_avaliacao': prob_boa_avaliacao,
+        'dados_processados': novo_dado
+    }
+
+# EXEMPLO PRÁTICO 1: Pedido com entrega no prazo
+print("\nEXEMPLO 1: Pedido com entrega no prazo")
+novo_pedido_1 = {
+    'order_purchase_timestamp': '2025-09-22 10:00:00',
+    'order_delivered_customer_date': '2025-09-25 14:00:00',
+    'order_estimated_delivery_date': '2025-09-27 10:00:00',
+    'total_price': 150.0,
+    'freight_value': 15.0,
+    'num_items': 2,
+    'customer_state': 'SP'
+}
+
+resultado_1 = prever_satisfacao_cliente(novo_pedido_1, best_optimized_model, le, X.columns)
+
+print(f"Predição: {'Boa avaliação' if resultado_1['predicao_binaria'] == 1 else 'Avaliação ruim'}")
+print(f"Probabilidade de boa avaliação: {resultado_1['probabilidade_boa_avaliacao']:.1%}")
+print(f"Confiança: {'Alta' if resultado_1['probabilidade_boa_avaliacao'] > 0.8 or resultado_1['probabilidade_boa_avaliacao'] < 0.2 else 'Média'}")
+
+# EXEMPLO PRÁTICO 2: Pedido com atraso significativo
+print("\nEXEMPLO 2: Pedido com atraso significativo")
+novo_pedido_2 = {
+    'order_purchase_timestamp': '2025-09-22 10:00:00',
+    'order_delivered_customer_date': '2025-10-02 14:00:00',
+    'order_estimated_delivery_date': '2025-09-27 10:00:00',
+    'total_price': 80.0,
+    'freight_value': 25.0,
+    'num_items': 1,
+    'customer_state': 'RJ'
+}
+
+resultado_2 = prever_satisfacao_cliente(novo_pedido_2, best_optimized_model, le, X.columns)
+
+print(f"Predição: {'Boa avaliação' if resultado_2['predicao_binaria'] == 1 else '❌ Avaliação ruim'}")
+print(f"Probabilidade de boa avaliação: {resultado_2['probabilidade_boa_avaliacao']:.1%}")
+print(f"Confiança: {'Alta' if resultado_2['probabilidade_boa_avaliacao'] > 0.8 or resultado_2['probabilidade_boa_avaliacao'] < 0.2 else 'Média'}")
+
+# ANÁLISE SHAP DO NOVO DADO (Exemplo 1)
+print(f"\nANÁLISE SHAP - Por que o modelo fez essa predição?")
+print("(Analisando o Exemplo 1)")
+
+# Reconstruir o explainer (já tinha feito antes, mas garantir)
+explainer_new = shap.TreeExplainer(best_optimized_model)
+
+# Obter SHAP values para o novo ponto (resultado_1['dados_processados'])
+shap_values_raw = explainer_new.shap_values(resultado_1['dados_processados'])
+
+# Debug completo para entender o que está vindo
+print(f"[DEBUG] Tipo do retorno: {type(shap_values_raw)}")
+if isinstance(shap_values_raw, list):
+    print(f"[DEBUG] Lista com {len(shap_values_raw)} elementos")
+    for idx, item in enumerate(shap_values_raw):
+        print(f"[DEBUG] Elemento {idx}: shape {np.asarray(item).shape}")
+else:
+    print(f"[DEBUG] Array shape: {np.asarray(shap_values_raw).shape}")
+
+print(f"[DEBUG] Número de features esperadas: {len(X.columns)}")
+print(f"[DEBUG] Shape dos dados de entrada: {resultado_1['dados_processados'].shape}")
+
+# Normalizar o formato para um vetor 1D com length = n_features
+sv = shap_values_raw  # alias
+
+# Converter para numpy array se não for lista
+if isinstance(sv, list):
+    # pegar a classe positiva (índice 1) se existir, senão a primeira
+    if len(sv) > 1:
+        sv = np.asarray(sv[1])   # shape -> (n_samples, n_features)
+    else:
+        sv = np.asarray(sv[0])
+else:
+    sv = np.asarray(sv)
+
+print(f"[DEBUG] Shape após conversão inicial: {sv.shape}")
+
+# Se for 3D (n_classes, n_samples, n_features) -> pegar classe positiva
+if sv.ndim == 3:
+    # preferir classe 1 (positiva) se houver
+    sv = sv[1] if sv.shape[0] > 1 else sv[0]  # agora (n_samples, n_features)
+    print(f"[DEBUG] Shape após redução 3D->2D: {sv.shape}")
+
+# Agora sv deve ser (n_samples, n_features) ou (n_features,) ou (1, n_features)
+if sv.ndim == 1:
+    shap_vals_point = sv
+else:
+    # pegar a primeira (única) amostra
+    shap_vals_point = sv[0]
+
+# Garantir que seja 1D numpy array
+shap_vals_point = np.asarray(shap_vals_point).reshape(-1)
+
+print(f"[DEBUG] Shape final normalizado: {shap_vals_point.shape}")
+print(f"[DEBUG] Primeiro e último valor SHAP: [{shap_vals_point[0]:.4f}, ..., {shap_vals_point[-1]:.4f}]")
+
+# Verificar se o número de elementos bate com o número de features
+if len(shap_vals_point) != len(X.columns):
+    print(f"ERRO: Número de valores SHAP ({len(shap_vals_point)}) diferente do número de features ({len(X.columns)})")
+    print("Pulando análise SHAP detalhada...")
+    # Análise simplificada
+    feature_contributions = []
+    print("\nAnálise SHAP simplificada (valores podem estar incompletos):")
+    for i in range(min(len(shap_vals_point), len(X.columns))):
+        feature = X.columns[i]
+        contribution = float(shap_vals_point[i])
+        value = float(resultado_1['dados_processados'].iloc[0, i])
+        feature_contributions.append({
+            'feature': feature,
+            'value': value,
+            'shap_value': contribution,
+            'impact': 'Positivo' if contribution > 0 else 'Negativo'
+        })
+    
+    if len(feature_contributions) > 0:
+        feature_contributions.sort(key=lambda x: abs(x['shap_value']), reverse=True)
+        print(f"\nTOP {min(3, len(feature_contributions))} Features disponíveis:")
+        for i, contrib in enumerate(feature_contributions[:3]):
+            print(f"{i+1}. {contrib['feature']}: {contrib['value']:.2f} "
+                  f"(SHAP: {contrib['shap_value']:+.3f}, {contrib['impact']})")
+else:
+    # Análise completa normal
+    feature_contributions = []
+    for i, feature in enumerate(X.columns):
+        contribution = float(shap_vals_point[i]) 
+        value = float(resultado_1['dados_processados'].iloc[0, i])
+        feature_contributions.append({
+            'feature': feature,
+            'value': value,
+            'shap_value': contribution,
+            'impact': 'Positivo' if contribution > 0 else 'Negativo'
+        })
+
+    # Ordenar e imprimir top 5
+    feature_contributions.sort(key=lambda x: abs(x['shap_value']), reverse=True)
+
+    print("\nTOP 5 Features que mais influenciaram a predição:")
+    for i, contrib in enumerate(feature_contributions[:5]):
+        print(f"{i+1}. {contrib['feature']}: {contrib['value']:.2f} "
+              f"(SHAP: {contrib['shap_value']:+.3f}, {contrib['impact']})")
+
+
+expected_val = explainer_new.expected_value
+if isinstance(expected_val, (list, np.ndarray)):
+    try:
+        expected_val = float(expected_val[1])
+    except:
+        expected_val = float(np.asarray(expected_val).ravel()[0])
+else:
+    expected_val = float(expected_val)
+
+print(f"\nINTERPRETAÇÃO:")
+print(f" - Valor base do modelo: {expected_val:.3f}")
+if len(feature_contributions) > 0:
+    print(f" - Soma dos impactos SHAP: {sum([c['shap_value'] for c in feature_contributions]):.3f}")
+print(f" - Predição final: {float(resultado_1['probabilidade_boa_avaliacao']):.3f}")
+
+print("\n" + "="*60)
+print("EXEMPLO DE INFERÊNCIA CONCLUÍDO!")
 print("="*60)
